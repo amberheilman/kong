@@ -10,6 +10,7 @@ local re_find      = ngx.re.find
 local concat       = table.concat
 local insert       = table.insert
 local format       = string.format
+local unpack       = unpack
 local assert       = assert
 local ipairs       = ipairs
 local pairs        = pairs
@@ -112,6 +113,8 @@ local validation_errors = {
   SUBSCHEMA_BAD_TYPE        = "error in definition of '%s': %s: cannot change type in a specialized field",
   SUBSCHEMA_BAD_FIELD       = "error in definition of '%s': %s: cannot create a new field",
   SUBSCHEMA_ABSTRACT_FIELD  = "error in schema definition: abstract field was not specialized",
+  -- transformations
+  TRANSFORMATION_ERROR      = "transformation failed: %s",
 }
 
 
@@ -486,6 +489,23 @@ local function get_schema_field(schema, name)
 end
 
 
+local function mutually_required(entity, field_names)
+  local nonempty = {}
+
+  for _, name in ipairs(field_names) do
+    if is_nonempty(get_field(entity, name)) then
+      insert(nonempty, name)
+    end
+  end
+
+  if #nonempty == 0 or #nonempty == #field_names then
+    return true
+  end
+
+  return nil, quoted_list(field_names)
+end
+
+
 --- Entity checkers are cross-field validation rules.
 -- An entity checker is implemented as an entry in this table,
 -- containing a mandatory field `fn`, the checker function,
@@ -710,21 +730,7 @@ Schema.entity_checkers = {
 
   mutually_required = {
     run_with_missing_fields = true,
-    fn = function(entity, field_names)
-      local nonempty = {}
-
-      for _, name in ipairs(field_names) do
-        if is_nonempty(get_field(entity, name)) then
-          insert(nonempty, name)
-        end
-      end
-
-      if #nonempty == 0 or #nonempty == #field_names then
-        return true
-      end
-
-      return nil, quoted_list(field_names)
-    end
+    fn = mutually_required,
   },
 
   mutually_exclusive_sets = {
@@ -1293,6 +1299,48 @@ do
   end
 end
 
+
+local function run_transformation_checks(self, input, original_input, errors)
+  if not self.transformations then
+    return
+  end
+
+  for _, transformation in ipairs(self.transformations) do
+    local args = {}
+    local argc = 0
+    local none_set = true
+    for _, input_field_name in ipairs(transformation.input) do
+      if is_nonempty(get_field(original_input or input, input_field_name)) then
+        none_set = false
+      end
+
+      argc = argc + 1
+      args[argc] = input_field_name
+    end
+
+    if not none_set then
+      if transformation.needs then
+        for _, input_field_name in ipairs(transformation.needs) do
+          argc = argc + 1
+          args[argc] = input_field_name
+        end
+      end
+
+      local ok, err = mutually_required(input, args)
+      if not ok then
+        insert_entity_error(errors, validation_errors.MUTUALLY_REQUIRED:format(err))
+
+      else
+        ok, err = mutually_required(original_input or input, transformation.input)
+        if not ok then
+          insert_entity_error(errors, validation_errors.MUTUALLY_REQUIRED:format(err))
+        end
+      end
+    end
+  end
+end
+
+
 --- Ensure that a given table contains only the primary-key
 -- fields of the entity and that their fields validate.
 -- @param pk A table with primary-key fields only.
@@ -1671,6 +1719,7 @@ end
 -- @param full_check If true, demands entity table to be complete.
 -- If false, accepts missing `required` fields when those are not
 -- needed for global checks.
+-- @param original_input The original input for transformation validations.
 -- @return True on success.
 -- On failure, it returns nil and a table containing all errors,
 -- indexed by field name for field errors, plus an "@entity" key
@@ -1689,7 +1738,7 @@ end
 --     }
 --  }
 -- In all cases, the input table is untouched.
-function Schema:validate(input, full_check)
+function Schema:validate(input, full_check, original_input)
   if full_check == nil then
     full_check = true
   end
@@ -1722,6 +1771,7 @@ function Schema:validate(input, full_check)
   end
 
   run_entity_checks(self, input, full_check, errors)
+  run_transformation_checks(self, input, original_input, errors)
 
   if next(errors) then
     return nil, errors
@@ -1761,12 +1811,13 @@ end
 -- It validates fields for their attributes,
 -- and runs the global entity checks against the entire table.
 -- @param input The input table.
+-- @param original_input The original input for transformation validations.
 -- @return True on success.
 -- On failure, it returns nil and a table containing all errors,
 -- indexed numerically for general errors, and by field name for field errors.
 -- In all cases, the input table is untouched.
-function Schema:validate_insert(input)
-  return self:validate(input, true)
+function Schema:validate_insert(input, original_input)
+  return self:validate(input, true, original_input)
 end
 
 
@@ -1775,11 +1826,12 @@ end
 -- fields when those are not needed for global checks,
 -- and runs the global checks against the entire table.
 -- @param input The input table.
+-- @param original_input The original input for transformation validations.
 -- @return True on success.
 -- On failure, it returns nil and a table containing all errors,
 -- indexed numerically for general errors, and by field name for field errors.
 -- In all cases, the input table is untouched.
-function Schema:validate_update(input)
+function Schema:validate_update(input, original_input)
 
   -- Monkey-patch some error messages to make it clearer why they
   -- apply during an update. This avoids propagating update-awareness
@@ -1792,7 +1844,7 @@ function Schema:validate_update(input)
   validation_errors.AT_LEAST_ONE_OF = "when updating, " .. aloo
   validation_errors.CONDITIONAL_AT_LEAST_ONE_OF = "when updating, " .. caloo
 
-  local ok, errors = self:validate(input, false)
+  local ok, errors = self:validate(input, false, original_input)
 
   -- Restore the original error messages
   validation_errors.REQUIRED_FOR_ENTITY_CHECK = rfec
@@ -1807,12 +1859,13 @@ end
 -- It validates fields for their attributes,
 -- and runs the global entity checks against the entire table.
 -- @param input The input table.
+-- @param original_input The original input for transformation validations.
 -- @return True on success.
 -- On failure, it returns nil and a table containing all errors,
 -- indexed numerically for general errors, and by field name for field errors.
 -- In all cases, the input table is untouched.
-function Schema:validate_upsert(input)
-  return self:validate(input, true)
+function Schema:validate_upsert(input, original_input)
+  return self:validate(input, true, original_input)
 end
 
 
@@ -1954,6 +2007,57 @@ local function allow_record_fields_by_name(record, loop)
       allow_record_fields_by_name(f, loop)
     end
   end
+end
+
+
+--- Run transformations on fields.
+-- @param input The input table.
+-- @param original_input The original input for transformation detection.
+-- @return the transformed entity
+function Schema:transform(input, original_input)
+  if not self.transformations then
+    return input
+  end
+
+  for _, transformation in ipairs(self.transformations) do
+    local func = transformation.func
+    local args = {}
+    local argc = 0
+    local all_set  = true
+    for _, input_field_name in ipairs(transformation.input) do
+      local value = get_field(original_input or input, input_field_name)
+      if is_nonempty(value) then
+        argc = argc + 1
+        if original_input then
+          args[argc] = get_field(input, input_field_name)
+        else
+          args[argc] = value
+        end
+
+      else
+        all_set = false
+        break
+      end
+    end
+
+    if all_set then
+      if transformation.needs then
+        for _, need in ipairs(transformation.needs) do
+          argc = argc + 1
+          args[argc] = get_field(input, need)
+        end
+      end
+
+      local data, err = func(unpack(args))
+      if err then
+        return nil, validation_errors.TRANSFORMATION_ERROR:format(err)
+      end
+
+      input = self:merge_values(data, input)
+    end
+  end
+
+  return input
 end
 
 

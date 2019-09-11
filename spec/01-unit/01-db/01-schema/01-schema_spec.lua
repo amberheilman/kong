@@ -1804,6 +1804,73 @@ describe("schema", function()
       assert.falsy(err)
     end)
 
+    it("test mutually required checks specified by transformations", function()
+      local Test = Schema.new({
+        fields = {
+          { a1 = { type = "string" } },
+          { a2 = { type = "string" } },
+          { a3 = { type = "string" } },
+        },
+        transformations = {
+          { input = { "a2" },       func = function() return {} end },
+          { input = { "a1", "a3" }, func = function() return {} end },
+        }
+      })
+
+      local ok, err = Test:validate_update({
+        a1 = "foo"
+      })
+      assert.is_falsy(ok)
+      assert.match("all or none of these fields must be set: 'a1', 'a3'", err["@entity"][1])
+
+      ok, err = Test:validate_update({
+        a2 = "foo"
+      })
+      assert.truthy(ok)
+      assert.falsy(err)
+    end)
+
+    it("test mutually required checks specified by transformations with needs", function()
+      local Test = Schema.new({
+        fields = {
+          { a1 = { type = "string" } },
+          { a2 = { type = "string" } },
+          { a3 = { type = "string" } },
+          { a4 = { type = "string" } },
+        },
+        transformations = {
+          { input = { "a2" }, func = function() return {} end },
+          { input = { "a1", "a3" }, needs = { "a4" }, func = function() return {} end },
+        }
+      })
+
+      local ok, err = Test:validate_update({
+        a1 = "foo"
+      })
+      assert.is_falsy(ok)
+      assert.match("all or none of these fields must be set: 'a1', 'a3', 'a4'", err["@entity"][1])
+
+      local ok, err = Test:validate_update(
+        {
+          a1 = "foo",
+          a3 = "bar",
+          a4 = "car",
+        },
+        {
+          a1 = "foo",
+          a3 = "bar",
+        }
+      )
+      assert.truthy(ok)
+      assert.falsy(err)
+
+      ok, err = Test:validate_update({
+        a2 = "foo"
+      })
+      assert.truthy(ok)
+      assert.falsy(err)
+    end)
+
     it("test mutually exclusive checks", function()
       local Test = Schema.new({
         fields = {
@@ -2987,6 +3054,284 @@ describe("schema", function()
 
       assert.falsy(ok)
       assert.equals(err.list, 'immutable field cannot be updated')
+    end)
+  end)
+
+  describe("transform", function()
+    it("transforms fields", function()
+      local test_schema = {
+        name = "test",
+        fields = {
+          {
+            name = {
+              type = "string"
+            },
+          },
+        },
+        transformations = {
+          {
+            input = { "name" },
+            func = function(name)
+              return { name = name:upper() }
+            end,
+          },
+        },
+      }
+      local entity = { name = "test1" }
+
+      local TestEntities = Schema.new(test_schema)
+      local transformed_entity, _ = TestEntities:transform(entity)
+
+      assert.truthy(transformed_entity)
+      assert.equal("TEST1", transformed_entity.name)
+    end)
+
+    it("transforms fields with input table", function()
+      local test_schema = {
+        name = "test",
+        fields = {
+          {
+            name = {
+              type = "string"
+            },
+          },
+        },
+        transformations = {
+          {
+            input = { "name" },
+            func = function(name)
+              return { name = name:upper() }
+            end,
+          },
+        },
+      }
+      local entity = { name = "test1" }
+      local input = { name = "we have a value" }
+
+      local TestEntities = Schema.new(test_schema)
+      local transformed_entity, _ = TestEntities:transform(entity, input)
+
+      assert.truthy(transformed_entity)
+      assert.equal("TEST1", transformed_entity.name)
+    end)
+
+    it("skips transformation when none of input matches", function()
+      local test_schema = {
+        name = "test",
+        fields = {
+          {
+            name = {
+              type = "string"
+            },
+          },
+        },
+        transformations = {
+          {
+            input = { "non_existent" },
+            func = function(non_existent)
+              return { name = non_existent:upper() }
+            end,
+          },
+        },
+      }
+      local entity = { name = "test1" }
+
+      local TestEntities = Schema.new(test_schema)
+      local transformed_entity, _ = TestEntities:transform(entity)
+
+      assert.truthy(transformed_entity)
+      assert.equal("test1", transformed_entity.name)
+    end)
+
+    it("skips transformation when none of input matches using input table", function()
+      local test_schema = {
+        name = "test",
+        fields = {
+          {
+            name = {
+              type = "string"
+            },
+          },
+        },
+        transformations = {
+          {
+            input = { "name" },
+            func = function(non_existent)
+              return { name = non_existent:upper() }
+            end,
+          },
+        },
+      }
+      local entity = { name = "test1" }
+      local input = { name = nil }
+
+      local TestEntities = Schema.new(test_schema)
+      local transformed_entity, _ = TestEntities:transform(entity, input)
+
+      assert.truthy(transformed_entity)
+      assert.equal("test1", transformed_entity.name)
+    end)
+
+
+    it("transforms fields with multiple transformations", function()
+      local test_schema = {
+        name = "test",
+        fields = {
+          {
+            name = {
+              type = "string"
+            },
+          },
+        },
+        transformations = {
+          {
+            input = { "name" },
+            func = function(name)
+              return { name = "How are you " .. name }
+            end,
+          },
+          {
+            input = { "name" },
+            func = function(name)
+              return { name = name .. "?" }
+            end,
+          },
+        },
+      }
+
+      local entity = { name = "Bob" }
+
+      local TestEntities = Schema.new(test_schema)
+      local transformed_entity, _ = TestEntities:transform(entity)
+
+      assert.truthy(transformed_entity)
+      assert.equal("How are you Bob?", transformed_entity.name)
+    end)
+
+    it("transforms any field not just those given as an input", function()
+      local test_schema = {
+        name = "test",
+        fields = {
+          {
+            name = {
+              type = "string"
+            },
+            age = {
+              type = "integer"
+            }
+          },
+        },
+        transformations = {
+          {
+            input = { "name" },
+            func = function(name)
+              return { age = #name }
+            end,
+          },
+        },
+      }
+
+      local entity = { name = "Bob" }
+
+      local TestEntities = Schema.new(test_schema)
+      local transformed_entity, _ = TestEntities:transform(entity)
+
+      assert.truthy(transformed_entity)
+      assert.equal("Bob", transformed_entity.name)
+      assert.equal(3, transformed_entity.age)
+    end)
+
+    it("returns error if transformation returns an error", function()
+      local test_schema = {
+        name = "test",
+        fields = {
+          {
+            name = {
+              type = "string"
+            },
+          },
+        },
+        transformations = {
+          {
+            input = { "name" },
+            func = function(name)
+              return nil, "unable to transform name"
+            end,
+          },
+        },
+      }
+      local entity = { name = "test1" }
+
+      local TestEntities = Schema.new(test_schema)
+      local transformed_entity, err = TestEntities:transform(entity)
+
+      assert.falsy(transformed_entity)
+      assert.equal("transformation failed: unable to transform name", err)
+    end)
+
+    it("does not skip transformation if needs are not fulfilled (this is handled by validation)", function()
+      local test_schema = {
+        name = "test",
+        fields = {
+          {
+            name = {
+              type = "string"
+            },
+            age = {
+              type = "integer"
+            },
+          },
+        },
+        transformations = {
+          {
+            input = { "name" },
+            needs = { "age" },
+            func = function(name, age)
+              return { name = name:upper() }
+            end,
+          },
+        },
+      }
+      local entity = { name = "test1" }
+
+      local TestEntities = Schema.new(test_schema)
+      local transformed_entity, _ = TestEntities:transform(entity)
+
+      assert.truthy(transformed_entity)
+      assert.equal("TEST1", transformed_entity.name)
+    end)
+
+
+    it("transforms fields with needs given to function", function()
+      local test_schema = {
+        name = "test",
+        fields = {
+          {
+            name = {
+              type = "string"
+            },
+            age = {
+              type = "integer"
+            },
+          },
+        },
+        transformations = {
+          {
+            input = { "name" },
+            needs = { "age" },
+            func = function(name, age)
+              return { name = name .. " " .. age }
+            end,
+          },
+        },
+      }
+      local entity = { name = "John", age = 13 }
+
+      local TestEntities = Schema.new(test_schema)
+      local transformed_entity, _ = TestEntities:transform(entity)
+
+      assert.truthy(transformed_entity)
+      assert.equal("John 13", transformed_entity.name)
     end)
   end)
 end)
